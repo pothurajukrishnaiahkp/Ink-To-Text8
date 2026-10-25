@@ -1,0 +1,1645 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts << 'EOF_INK'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "InkToText"
+          include(":app")
+          EOF_INK
+          cat > build.gradle.kts << 'EOF_INK'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_INK
+          cat > gradle.properties << 'EOF_INK'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_INK
+          mkdir -p app
+          cat > app/build.gradle.kts << 'EOF_INK'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.inktotext"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.inktotext"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.mlkit:digital-ink-recognition:18.1.0")
+          }
+          EOF_INK
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml << 'EOF_INK'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher"
+                  android:label="InkToText"
+                  android:theme="@style/Theme.AppCompat.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_INK
+          mkdir -p app/src/main/java/com/example/inktotext
+          cat > app/src/main/java/com/example/inktotext/MainActivity.kt << 'EOF_INK'
+          package com.example.inktotext
+
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.ContentValues
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.Typeface
+          import android.os.Bundle
+          import android.os.Environment
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.HorizontalScrollView
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AlertDialog
+          import androidx.appcompat.app.AppCompatActivity
+          import com.google.mlkit.common.model.DownloadConditions
+          import com.google.mlkit.common.model.RemoteModelManager
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognition
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModel
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognitionModelIdentifier
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognizer
+          import com.google.mlkit.vision.digitalink.DigitalInkRecognizerOptions
+          import com.google.mlkit.vision.digitalink.Ink
+
+          // Full-screen board: pen strokes, and recognized text/maths drawn in the SAME place
+          class DrawingView(context: Context) : View(context) {
+              class TextItem(
+                  val text: String, val copy: String, val cx: Float, val baseline: Float,
+                  val size: Float, val color: Int, val sup: Boolean
+              ) { var group = 0 }
+
+              class LineItem(
+                  val x1: Float, val y1: Float, val x2: Float, val y2: Float, val color: Int
+              ) { var group = 0 }
+
+              // One converted line of writing, remembered for Copy/Save
+              class Group(val copy: String, val y: Float, val x0: Float, val size: Float, val count: Int)
+
+              class PStroke(val stroke: Ink.Stroke, val path: Path, val color: Int)
+
+              var penColor = Color.BLACK
+              var eraser = false
+              private val eraseRadius = 40f
+              private val palmSize = 60f * context.resources.displayMetrics.density  // contact bigger than this = palm
+              private var erasing = false
+              private var lastStylus = 0L
+              private var eraseX = 0f
+              private var eraseY = 0f
+              private var eraseShowR = 0f
+              private val circlePaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 4f; isAntiAlias = true; color = 0xFF9E9E9E.toInt()
+              }
+
+              private val inkPaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 8f; isAntiAlias = true
+                  strokeJoin = Paint.Join.ROUND; strokeCap = Paint.Cap.ROUND
+              }
+              private val linePaint = Paint().apply {
+                  style = Paint.Style.STROKE; strokeWidth = 6f; isAntiAlias = true
+                  strokeCap = Paint.Cap.ROUND
+              }
+              private val textPaint = Paint().apply {
+                  isAntiAlias = true; typeface = Typeface.SANS_SERIF; textAlign = Paint.Align.CENTER
+              }
+              private var curPath = Path()
+              private var curColor = Color.BLACK
+              private var strokeBuilder: Ink.Stroke.Builder? = null
+
+              val pending = mutableListOf<PStroke>()           // handwriting not yet converted
+              private val items = mutableListOf<TextItem>()    // converted text
+              private val lineItems = mutableListOf<LineItem>() // fraction bars, root signs
+              private val groups = HashMap<Int, Group>()
+
+              var onStrokeFinished: (() -> Unit)? = null
+              var onStrokeStarted: (() -> Unit)? = null
+
+              init { setBackgroundColor(Color.WHITE) }
+
+              override fun onDraw(canvas: Canvas) {
+                  for (p in pending) { inkPaint.color = p.color; canvas.drawPath(p.path, inkPaint) }
+                  inkPaint.color = curColor
+                  canvas.drawPath(curPath, inkPaint)
+                  for (ln in lineItems) {
+                      linePaint.color = ln.color
+                      canvas.drawLine(ln.x1, ln.y1, ln.x2, ln.y2, linePaint)
+                  }
+                  for (ti in items) {
+                      textPaint.color = ti.color
+                      textPaint.textSize = ti.size
+                      canvas.drawText(ti.text, ti.cx, ti.baseline, textPaint)
+                  }
+                  if (erasing) canvas.drawCircle(eraseX, eraseY, eraseShowR, circlePaint)
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  val x = e.x; val y = e.y; val t = SystemClock.uptimeMillis()
+
+                  // ---- Erase with the hand: a palm / fist (big contact), two fingers together,
+                  // ---- the stylus eraser end, or the Eraser button. No need to pick a tool.
+                  val now = SystemClock.uptimeMillis()
+                  if (e.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS) lastStylus = now
+                  val stylusNear = now - lastStylus < 1000      // a hand resting next to the pen is ignored
+                  var bigIdx = -1
+                  var bigR = eraseRadius
+                  for (i in 0 until e.pointerCount) {
+                      val tt = e.getToolType(i)
+                      val big = tt == MotionEvent.TOOL_TYPE_FINGER && !stylusNear &&
+                              e.getTouchMajor(i) >= palmSize
+                      if (tt == MotionEvent.TOOL_TYPE_ERASER || big) {
+                          bigIdx = i
+                          bigR = maxOf(eraseRadius, e.getTouchMajor(i) / 2f)
+                          break
+                      }
+                  }
+                  val twoFingers = e.pointerCount >= 2 && !stylusNear
+                  if (eraser || bigIdx >= 0 || twoFingers || erasing) {
+                      val ma = e.actionMasked
+                      if (ma == MotionEvent.ACTION_UP || ma == MotionEvent.ACTION_CANCEL) {
+                          if (erasing) { erasing = false; onStrokeFinished?.invoke() }
+                          invalidate()
+                          return true
+                      }
+                      if (!erasing) {
+                          erasing = true
+                          strokeBuilder = null          // drop a stroke that was only a palm landing
+                          curPath = Path()
+                          onStrokeStarted?.invoke()
+                      }
+                      val r = if (bigIdx >= 0) bigR else eraseRadius
+                      for (i in 0 until e.pointerCount) erase(e.getX(i), e.getY(i), r)
+                      eraseX = e.getX(0); eraseY = e.getY(0); eraseShowR = r
+                      invalidate()
+                      return true
+                  }
+
+                  when (e.action) {
+                      MotionEvent.ACTION_DOWN -> {
+                          onStrokeStarted?.invoke()
+                          curColor = penColor
+                          curPath = Path().also { it.moveTo(x, y) }
+                          strokeBuilder = Ink.Stroke.builder().also {
+                              it.addPoint(Ink.Point.create(x, y, t))
+                          }
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (strokeBuilder == null) return true
+                          curPath.lineTo(x, y)
+                          strokeBuilder?.addPoint(Ink.Point.create(x, y, t))
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          if (strokeBuilder == null) return true
+                          curPath.lineTo(x, y)
+                          strokeBuilder?.addPoint(Ink.Point.create(x, y, t))
+                          strokeBuilder?.let { pending.add(PStroke(it.build(), curPath, curColor)) }
+                          curPath = Path()
+                          strokeBuilder = null
+                          onStrokeFinished?.invoke()
+                      }
+                      else -> return false
+                  }
+                  invalidate()
+                  return true
+              }
+
+              private fun distToSegment(px: Float, py: Float, ln: LineItem): Float {
+                  val dx = ln.x2 - ln.x1; val dy = ln.y2 - ln.y1
+                  val len2 = dx * dx + dy * dy
+                  var t = if (len2 == 0f) 0f else ((px - ln.x1) * dx + (py - ln.y1) * dy) / len2
+                  t = t.coerceIn(0f, 1f)
+                  val cx = ln.x1 + t * dx; val cy = ln.y1 + t * dy
+                  return Math.hypot((px - cx).toDouble(), (py - cy).toDouble()).toFloat()
+              }
+
+              // Eraser: removes handwriting, converted text and lines inside the circle
+              private fun erase(x: Float, y: Float, rad: Float) {
+                  pending.removeAll { p ->
+                      p.stroke.points.any {
+                          Math.hypot((it.x - x).toDouble(), (it.y - y).toDouble()) < rad
+                      }
+                  }
+                  lineItems.removeAll { ln -> distToSegment(x, y, ln) < rad }
+                  items.removeAll { item ->
+                      textPaint.textSize = item.size
+                      val w = textPaint.measureText(item.text) / 2 + rad
+                      x in (item.cx - w)..(item.cx + w) &&
+                              y in (item.baseline - item.size - rad / 2)..(item.baseline + item.size * 0.3f + rad / 2)
+                  }
+              }
+
+              // Replace the handwritten strokes in `done` by recognized text
+              fun commit(
+                  done: List<PStroke>, newItems: List<TextItem>,
+                  newLines: List<LineItem>, newGroups: Map<Int, Group>
+              ) {
+                  pending.removeAll { p -> done.any { it === p } }
+                  items.addAll(newItems)
+                  lineItems.addAll(newLines)
+                  groups.putAll(newGroups)
+                  invalidate()
+              }
+
+              fun clearAll() {
+                  pending.clear(); items.clear(); lineItems.clear(); groups.clear()
+                  curPath = Path(); strokeBuilder = null
+                  invalidate()
+              }
+
+              fun toBitmap(): Bitmap {
+                  val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                  draw(Canvas(bmp))
+                  return bmp
+              }
+
+              // All converted text line by line: (a)/(b), √(x), x² style
+              fun plainText(): String {
+                  class E(val y: Float, val x0: Float, val size: Float, val text: String)
+                  val entries = mutableListOf<E>()
+                  for ((g, list) in items.groupBy { it.group }) {
+                      val info = groups[g]
+                      if (info != null && info.count == list.size) {
+                          entries.add(E(info.y, info.x0, info.size, info.copy))
+                      } else {
+                          // partly erased: fall back to remaining characters
+                          val normals = list.filter { !it.sup }
+                          val ys = (if (normals.isEmpty()) list else normals).map { it.baseline }
+                          entries.add(E(ys.average().toFloat(), list.minOf { it.cx }, list[0].size,
+                              list.sortedBy { it.cx }.joinToString("") { it.copy }))
+                      }
+                  }
+                  val lines = mutableListOf<MutableList<E>>()
+                  for (e in entries.sortedBy { it.y }) {
+                      val ln = lines.firstOrNull { Math.abs(it[0].y - e.y) < e.size * 0.6f }
+                      if (ln != null) ln.add(e) else lines.add(mutableListOf(e))
+                  }
+                  return lines.joinToString("\n") { ln ->
+                      ln.sortedBy { it.x0 }.joinToString("") { it.text }
+                  }
+              }
+          }
+
+          // Small calculator: + - * / ^ ( ) sqrt( ), implicit multiplication like 2(3+4)
+          private class Parser(val s: String) {
+              var i = 0
+              private fun peek(): Char = if (i < s.length) s[i] else '\u0000'
+
+              fun parse(): Double {
+                  val v = expr()
+                  if (i != s.length) throw IllegalArgumentException()
+                  return v
+              }
+
+              private fun expr(): Double {
+                  var v = term()
+                  while (peek() == '+' || peek() == '-') {
+                      val op = s[i++]
+                      val r = term()
+                      v = if (op == '+') v + r else v - r
+                  }
+                  return v
+              }
+
+              private fun term(): Double {
+                  var v = power()
+                  while (true) {
+                      val c = peek()
+                      if (c == '*') { i++; v *= power() }
+                      else if (c == '/') { i++; v /= power() }
+                      else if (c == '(' || c == 's' || c.isDigit() || c == '.') v *= power()
+                      else break
+                  }
+                  return v
+              }
+
+              private fun power(): Double {
+                  val b = unary()
+                  if (peek() == '^') { i++; return Math.pow(b, unary()) }
+                  return b
+              }
+
+              private fun unary(): Double {
+                  if (peek() == '-') { i++; return -unary() }
+                  if (peek() == '+') { i++; return unary() }
+                  return atom()
+              }
+
+              private fun atom(): Double {
+                  if (s.startsWith("sqrt", i)) { i += 4; return Math.sqrt(atom()) }
+                  if (peek() == '(') {
+                      i++
+                      val v = expr()
+                      if (peek() != ')') throw IllegalArgumentException()
+                      i++
+                      return v
+                  }
+                  val st = i
+                  while (peek().isDigit() || peek() == '.') i++
+                  if (st == i) throw IllegalArgumentException()
+                  return s.substring(st, i).toDouble()
+              }
+          }
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var recognizer: DigitalInkRecognizer
+              private lateinit var drawing: DrawingView
+              private val handler = Handler(Looper.getMainLooper())
+              private var modelReady = false
+              private var textScale = 1.0f
+              private var textMode = 0       // 0 = Abc, 1 = ABC (all capitals), 2 = Chem (chemistry), 3 = 123 (digits)
+              private val mathMode get() = textMode == 3
+              private var baseSize = 0f      // one text size for the whole board (set from first writing)
+              private var nextGroup = 1
+              private val measurePaint = Paint().apply { typeface = Typeface.SANS_SERIF }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  drawing = DrawingView(this)
+
+                  // ---- Toolbar ----
+                  fun tool(label: String) = Button(this).apply { text = label; isAllCaps = false }
+                  val modeBtn = tool("✏️ Pen")
+                  val mathBtn = tool("Abc")
+                  val minusBtn = tool("A−")
+                  val plusBtn = tool("A+")
+                  val scaleLabel = TextView(this).apply {
+                      text = "100%"; gravity = Gravity.CENTER; setPadding(dp(6), 0, dp(6), 0)
+                  }
+                  val saveBtn = tool("Save")
+                  val copyBtn = tool("Copy")
+                  val clearBtn = tool("Clear")
+
+                  val colors = listOf(
+                      Color.BLACK, 0xFFD32F2F.toInt(), 0xFF1976D2.toInt(),
+                      0xFF388E3C.toInt(), 0xFFF57C00.toInt()
+                  )
+                  val colorBtns = colors.map { c ->
+                      Button(this).apply {
+                          setBackgroundColor(c); setTextColor(Color.WHITE)
+                          minWidth = 0; minimumWidth = 0
+                          layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).also {
+                              it.setMargins(dp(4), dp(4), dp(4), dp(4))
+                          }
+                      }
+                  }
+                  fun refresh() {
+                      colorBtns.forEachIndexed { i, b -> b.text = if (colors[i] == drawing.penColor) "✓" else "" }
+                      modeBtn.text = if (drawing.eraser) "🧽 Eraser" else "✏️ Pen"
+                      mathBtn.text = arrayOf("Abc", "ABC", "Chem", "123")[textMode]
+                      scaleLabel.text = "${Math.round(textScale * 100)}%"
+                  }
+
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                      addView(modeBtn)
+                      addView(mathBtn)
+                      colorBtns.forEach { addView(it) }
+                      addView(minusBtn); addView(scaleLabel); addView(plusBtn)
+                      addView(saveBtn); addView(copyBtn); addView(clearBtn)
+                  }
+                  val bar = HorizontalScrollView(this).apply {
+                      setBackgroundColor(0xEEFFFFFF.toInt()); addView(row)
+                  }
+                  val frame = FrameLayout(this).apply {
+                      addView(drawing, FrameLayout.LayoutParams(-1, -1))
+                      addView(bar, FrameLayout.LayoutParams(-1, -2, Gravity.TOP))
+                  }
+                  setContentView(frame)
+                  refresh()
+
+                  modeBtn.setOnClickListener { drawing.eraser = !drawing.eraser; refresh() }
+                  mathBtn.setOnClickListener { textMode = (textMode + 1) % 4; refresh() }
+                  colors.forEachIndexed { i, c ->
+                      colorBtns[i].setOnClickListener {
+                          drawing.penColor = c; drawing.eraser = false; refresh()
+                      }
+                  }
+                  minusBtn.setOnClickListener { textScale = maxOf(0.5f, textScale - 0.1f); refresh() }
+                  plusBtn.setOnClickListener { textScale = minOf(3.0f, textScale + 0.1f); refresh() }
+                  clearBtn.setOnClickListener { drawing.clearAll(); baseSize = 0f }
+                  copyBtn.setOnClickListener {
+                      val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("text", drawing.plainText()))
+                      Toast.makeText(this, "Copied", Toast.LENGTH_SHORT).show()
+                  }
+                  saveBtn.setOnClickListener {
+                      AlertDialog.Builder(this)
+                          .setTitle("Save")
+                          .setItems(arrayOf("Image (PNG)", "Text (.txt)")) { _, which ->
+                              if (which == 0) saveImage() else saveText()
+                          }.show()
+                  }
+
+                  // ---- Recognition ----
+                  setupRecognizer("en-US")
+                  drawing.onStrokeStarted = { handler.removeCallbacksAndMessages(null) }
+                  drawing.onStrokeFinished = {
+                      handler.removeCallbacksAndMessages(null)
+                      handler.postDelayed({ recognizeAndReplace() }, 800)
+                  }
+              }
+
+              // ---- Save (Android 10+; no storage permission needed) ----
+              private fun saveImage() {
+                  try {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Images.Media.DISPLAY_NAME, "board_${System.currentTimeMillis()}.png")
+                          put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                          put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/InkToText")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
+                      contentResolver.openOutputStream(uri)?.use {
+                          drawing.toBitmap().compress(Bitmap.CompressFormat.PNG, 100, it)
+                      }
+                      Toast.makeText(this, "Gallery లో Save అయింది", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Save failed", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private fun saveText() {
+                  try {
+                      val values = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, "board_${System.currentTimeMillis()}.txt")
+                          put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/InkToText")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)!!
+                      contentResolver.openOutputStream(uri)?.use {
+                          it.write(drawing.plainText().toByteArray(Charsets.UTF_8))
+                      }
+                      Toast.makeText(this, "Downloads లో Save అయింది", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Save failed", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              // First run downloads the model once (needs internet). After that: offline.
+              private fun setupRecognizer(tag: String) {
+                  val id = DigitalInkRecognitionModelIdentifier.fromLanguageTag(tag)!!
+                  val model = DigitalInkRecognitionModel.builder(id).build()
+                  recognizer = DigitalInkRecognition.getClient(
+                      DigitalInkRecognizerOptions.builder(model).build()
+                  )
+                  val manager = RemoteModelManager.getInstance()
+                  manager.isModelDownloaded(model).addOnSuccessListener { downloaded ->
+                      if (downloaded) { modelReady = true; return@addOnSuccessListener }
+                      Toast.makeText(this, "Model download అవుతోంది…", Toast.LENGTH_LONG).show()
+                      manager.download(model, DownloadConditions.Builder().build())
+                          .addOnSuccessListener {
+                              modelReady = true
+                              Toast.makeText(this, "సిద్ధం. వ్రాయండి!", Toast.LENGTH_SHORT).show()
+                          }
+                          .addOnFailureListener {
+                              Toast.makeText(this, "Download failed. Internet ఆన్ చేయండి.",
+                                  Toast.LENGTH_LONG).show()
+                          }
+                  }
+              }
+
+              // ================= Maths layout =================
+
+              // One written symbol (may have several strokes, e.g. "=" or "x")
+              private class Sym(var l: Float, var t: Float, var r: Float, var b: Float, val color: Int) {
+                  val strokes = mutableListOf<Ink.Stroke>()
+                  var text = ""
+                  var root = false   // a √ sign drawn with its top bar
+                  var flat = false   // a single long horizontal stroke (fraction bar or minus)
+                  var fixed: String? = null  // "+", "=", "-", "√" decided from the shape of the strokes
+                  val w get() = r - l
+                  val h get() = b - t
+                  val cy get() = (t + b) / 2
+                  val cx get() = (l + r) / 2
+              }
+
+              // Layout element: a plain symbol, a fraction block, or a root block
+              private class El(
+                  val kind: Int,                      // 0 plain, 1 fraction, 2 root
+                  val sym: Sym,                       // the symbol / the bar / the √ sign
+                  val a: List<Sym> = emptyList(),     // numerator, or content under √
+                  val d: List<Sym> = emptyList()      // denominator
+              ) {
+                  var l = 0f; var t = 0f; var r = 0f; var b = 0f
+                  var sup = false
+                  var sub = false
+                  val h get() = b - t
+                  val cy get() = (t + b) / 2
+                  init {
+                      val all = listOf(sym) + a + d
+                      l = all.minOf { it.l }; t = all.minOf { it.t }
+                      r = all.maxOf { it.r }; b = all.maxOf { it.b }
+                  }
+              }
+
+              private class Out {
+                  val items = mutableListOf<DrawingView.TextItem>()
+                  val lines = mutableListOf<DrawingView.LineItem>()
+                  val groups = HashMap<Int, DrawingView.Group>()
+              }
+
+              private class Res(
+                  val copy: String, val expr: String, val baseline: Float, val size: Float,
+                  val right: Float
+              )
+
+              // √ drawn as: small tick, down, up, long top bar, all in ONE stroke
+              private fun isRoot(st: Ink.Stroke, l: Float, t: Float, r: Float, b: Float): Boolean {
+                  val pts = st.points
+                  val w = r - l; val h = b - t
+                  // tall enough: a slightly tilted horizontal line is NOT a root sign
+                  if (pts.size < 10 || h < 30f || w < h * 0.9f || h < w * 0.2f) return false
+                  val first = pts.first(); val last = pts.last()
+                  if (first.x > l + 0.3f * w || first.y < t + 0.3f * h) return false
+                  if (last.x < l + 0.75f * w || last.y > t + 0.2f * h) return false
+                  var lowIdx = 0
+                  for (i in pts.indices) if (pts[i].y > pts[lowIdx].y) lowIdx = i
+                  val low = pts[lowIdx]
+                  if (lowIdx < 2 || lowIdx > pts.size * 3 / 4) return false  // the V comes before the long bar
+                  if (low.x > l + 0.45f * w) return false
+                  if (low.y - first.y < 0.15f * h) return false              // first goes DOWN ...
+                  if (low.y - last.y < 0.6f * h) return false                // ... then climbs to the bar
+                  return true
+              }
+
+              private fun canMerge(s: Sym, l: Float, t: Float, r: Float, b: Float): Boolean {
+                  val w2 = r - l
+                  val cx2 = (l + r) / 2
+                  val inside = if (w2 <= s.w) cx2 >= s.l - 5 && cx2 <= s.r + 5
+                  else s.cx >= l - 5 && s.cx <= r + 5
+                  if (!inside) return false
+                  val vo = minOf(s.b, b) - maxOf(s.t, t)
+                  val maxH = maxOf(s.h, b - t, 20f)
+                  if (vo <= 0 && -vo > 0.8f * maxH) return false
+                  // a long flat bar with a much narrower stroke away from it = fraction, not one symbol
+                  val wide = maxOf(s.w, w2); val narrow = minOf(s.w, w2)
+                  val wideH = if (s.w >= w2) s.h else (b - t)
+                  if (wide > 2.5f * maxOf(wideH, 10f) && narrow < 0.5f * wide && vo <= 0) return false
+                  return true
+              }
+
+              private fun bounds(st: Ink.Stroke): FloatArray {
+                  var l = Float.MAX_VALUE; var t = Float.MAX_VALUE
+                  var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+                  for (p in st.points) {
+                      l = minOf(l, p.x); r = maxOf(r, p.x); t = minOf(t, p.y); b = maxOf(b, p.y)
+                  }
+                  return floatArrayOf(l, t, r, b)
+              }
+
+              // Reaction arrow: a long flat line with a small head (one or two strokes) at its right end
+              private fun isArrow(s: Sym): Boolean {
+                  val bs = s.strokes.map { bounds(it) }
+                  val shaft = bs.maxByOrNull { it[2] - it[0] } ?: return false
+                  val sw = shaft[2] - shaft[0]; val sh = shaft[3] - shaft[1]
+                  if (sw < 40f || sw < 2.5f * maxOf(sh, 8f)) return false
+                  val sy = (shaft[1] + shaft[3]) / 2
+                  val others = bs.filter { it !== shaft }
+                  if (others.isEmpty()) return false
+                  for (o in others) {
+                      val ow = o[2] - o[0]; val oh = o[3] - o[1]
+                      val ox = (o[0] + o[2]) / 2; val oy = (o[1] + o[3]) / 2
+                      if (ow > 0.5f * sw || oh < 0.12f * sw || oh > 0.8f * sw || ow < 0.2f * oh) return false
+                      if (ox < shaft[0] + 0.72f * sw || Math.abs(oy - sy) > 0.6f * oh) return false
+                  }
+                  return true
+              }
+
+              // "+" "=" and arrows are recognised from their shape, because letter models often mistake them
+              private fun detectFixed(s: Sym): String? {
+                  val n = s.strokes.size
+                  if (s.root || n < 2 || n > 3) return null
+                  if (isArrow(s)) return "→"
+                  if (n != 2) return null
+                  val a = bounds(s.strokes[0]); val b = bounds(s.strokes[1])
+                  val wa = a[2] - a[0]; val ha = a[3] - a[1]
+                  val wb = b[2] - b[0]; val hb = b[3] - b[1]
+                  val flatA = wa > 1.8f * maxOf(ha, 8f)
+                  val flatB = wb > 1.8f * maxOf(hb, 8f)
+                  if (flatA && flatB) {
+                      return if (minOf(wa, wb) / maxOf(wa, wb) > 0.5f) "=" else null
+                  }
+                  val hz: FloatArray; val vt: FloatArray
+                  if (flatA && hb > 1.8f * maxOf(wb, 8f)) { hz = a; vt = b }
+                  else if (flatB && ha > 1.8f * maxOf(wa, 8f)) { hz = b; vt = a }
+                  else return null
+                  val hw = hz[2] - hz[0]; val vh = vt[3] - vt[1]
+                  val fx = ((vt[0] + vt[2]) / 2 - hz[0]) / hw
+                  val fy = ((hz[1] + hz[3]) / 2 - vt[1]) / vh
+                  val ratio = hw / vh
+                  return if (fx in 0.3f..0.7f && fy in 0.35f..0.65f && ratio in 0.55f..1.8f) "+" else null
+              }
+
+              private fun groupSymbols(list: List<DrawingView.PStroke>): List<Sym> {
+                  val syms = mutableListOf<Sym>()
+                  for (ps in list) {
+                      var l = Float.MAX_VALUE; var t = Float.MAX_VALUE
+                      var r = -Float.MAX_VALUE; var b = -Float.MAX_VALUE
+                      for (p in ps.stroke.points) {
+                          l = minOf(l, p.x); r = maxOf(r, p.x)
+                          t = minOf(t, p.y); b = maxOf(b, p.y)
+                      }
+                      val rootStroke = isRoot(ps.stroke, l, t, r, b)
+                      val host = if (rootStroke) null
+                      else syms.firstOrNull { !it.root && canMerge(it, l, t, r, b) }
+                      if (host != null) {
+                          host.strokes.add(ps.stroke)
+                          host.l = minOf(host.l, l); host.r = maxOf(host.r, r)
+                          host.t = minOf(host.t, t); host.b = maxOf(host.b, b)
+                      } else {
+                          syms.add(Sym(l, t, r, b, ps.color).also {
+                              it.strokes.add(ps.stroke); it.root = rootStroke
+                          })
+                      }
+                  }
+                  for (s in syms) {
+                      s.flat = !s.root && s.strokes.size == 1 && s.w > 2f * maxOf(s.h, 10f)
+                      s.fixed = detectFixed(s)
+                  }
+                  return syms.sortedBy { it.l }
+              }
+
+              private fun tickWidth(s: Sym) = minOf(s.h * 0.55f, s.w * 0.4f)
+
+              // Find fractions and roots, and turn everything else into plain elements
+              private fun buildElements(syms: List<Sym>): List<El> {
+                  if (syms.isEmpty()) return emptyList()
+                  val hs = syms.filter { !it.root && !it.flat }.map { it.h }.sorted()
+                  val refH = if (hs.isEmpty()) 40f else hs[hs.size / 2]
+                  val consumed = HashSet<Sym>()
+                  val blocks = mutableListOf<El>()
+                  for (c in syms.filter { it.root || it.flat }.sortedByDescending { it.w }) {
+                      if (c in consumed) continue
+                      if (c.root) {
+                          val tw = tickWidth(c)
+                          val inner = syms.filter {
+                              it !== c && it !in consumed && it.cx > c.l + tw - 5 && it.cx < c.r + 5 &&
+                                      it.cy > c.t && it.cy < c.b + c.h * 0.2f
+                          }
+                          if (inner.isEmpty()) continue
+                          consumed.add(c); consumed.addAll(inner)
+                          blocks.add(El(2, c, inner))
+                      } else {
+                          val near = syms.filter {
+                              it !== c && it !in consumed && it.cx >= c.l - 5 && it.cx <= c.r + 5 &&
+                                      Math.abs(it.cy - c.cy) < 4 * refH
+                          }
+                          val num = near.filter { it.cy < c.cy }
+                          val den = near.filter { it.cy >= c.cy }
+                          if (num.isEmpty() || den.isEmpty()) continue
+                          consumed.add(c); consumed.addAll(near)
+                          blocks.add(El(1, c, num, den))
+                      }
+                  }
+                  val plain = syms.filter { it !in consumed }.map {
+                      if (it.fixed == null && it.root) it.fixed = "√"
+                      if (it.fixed == null && it.flat) it.fixed = "-"
+                      El(0, it)
+                  }
+                  return (plain + blocks).sortedBy { it.l }
+              }
+
+              // Split elements into lines (powers sit above the line, so allow some margin)
+              private fun groupLines(els: List<El>): List<List<El>> {
+                  val lines = mutableListOf<MutableList<El>>()
+                  for (e in els) {
+                      val line = lines.firstOrNull { ln ->
+                          val t = ln.minOf { it.t }; val b = ln.maxOf { it.b }; val h = b - t
+                          e.cy >= t - 0.8f * h && e.cy <= b + 0.3f * h
+                      }
+                      if (line != null) line.add(e) else lines.add(mutableListOf(e))
+                  }
+                  return lines.sortedBy { ln -> ln.minOf { it.t } }
+              }
+
+              private fun addRootLines(s: Sym, out: Out) {
+                  val tw = tickWidth(s)
+                  val ax = s.l; val ay = s.t + 0.62f * s.h
+                  val bx = s.l + 0.22f * tw; val by = s.t + 0.55f * s.h
+                  val cx = s.l + 0.55f * tw; val cy = s.b
+                  val dx = s.l + tw; val dy = s.t
+                  out.lines.add(DrawingView.LineItem(ax, ay, bx, by, s.color))
+                  out.lines.add(DrawingView.LineItem(bx, by, cx, cy, s.color))
+                  out.lines.add(DrawingView.LineItem(cx, cy, dx, dy, s.color))
+                  out.lines.add(DrawingView.LineItem(dx, dy, s.r, dy, s.color))
+              }
+
+              // A group of consecutive symbols that is recognized together (context makes it accurate)
+              // digit = recognise symbol by symbol and prefer digits/operators (powers, 123 mode)
+              private class Seg(val syms: List<Sym>, val digit: Boolean) { var text = "" }
+
+              // kind 0 = text run, 1 = raised (power) run, 2 = fraction/root block,
+              // 3 = lowered (subscript) run, 4 = one symbol known from its shape (+ = - √)
+              private class Part(val kind: Int, val els: List<El>)
+
+              private var segMap: Map<Sym, Seg> = emptyMap()
+
+              // Decide which symbols are powers or subscripts, then cut the line into parts.
+              // Powers/subscripts are judged against the LINE: its normal letter height and its baseline.
+              private fun computeParts(els: List<El>): List<Part> {
+                  for (e in els) { e.sup = false; e.sub = false }
+                  val plain = els.filter { it.kind == 0 && it.sym.fixed == null }
+                  if (plain.size >= 2) {
+                      val hs = plain.map { it.h }.sorted()
+                      val refH = hs[((hs.size - 1) * 0.85f).toInt()]
+                      val tall = plain.filter { it.h >= 0.8f * refH }
+                      val refBottom = tall.map { it.b }.sorted()[tall.size / 2]
+                      var script: El? = null
+                      var scriptSup = false
+                      var sawBase = false
+                      for (e in els) {
+                          if (e.kind != 0 || e.sym.fixed != null) { script = null; sawBase = true; continue }
+                          val u = script
+                          var kind = 0   // 1 = power, 2 = subscript
+                          if (sawBase && e.h <= 0.85f * refH && e.h >= 0.25f * refH) {
+                              if (u != null && Math.abs(e.cy - u.cy) < 0.7f * u.h && e.l - u.r < 1.5f * u.h)
+                                  kind = if (scriptSup) 1 else 2
+                              else if (e.b <= refBottom - 0.35f * refH) kind = 1
+                              else if (e.b >= refBottom + 0.1f * refH) kind = 2
+                          }
+                          if (kind == 1) { e.sup = true; script = e; scriptSup = true }
+                          else if (kind == 2) { e.sub = true; script = e; scriptSup = false }
+                          else { script = null; sawBase = true }
+                      }
+                  }
+
+                  val parts = mutableListOf<Part>()
+                  var cur = mutableListOf<El>()
+                  var curKind = 0
+                  fun flush() {
+                      if (cur.isNotEmpty()) { parts.add(Part(curKind, cur)); cur = mutableListOf() }
+                  }
+                  for (e in els) {
+                      if (e.kind != 0) { flush(); parts.add(Part(2, listOf(e))); continue }
+                      val k = if (e.sup) 1 else if (e.sub) 3 else if (e.sym.fixed != null) 4 else 0
+                      if (k == 4) { flush(); parts.add(Part(4, listOf(e))); continue }
+                      if (cur.isNotEmpty() && k != curKind) flush()
+                      curKind = k
+                      cur.add(e)
+                  }
+                  flush()
+                  return parts
+              }
+
+              // Pass 1: list every group that must be sent to the recogniser
+              private fun collect(els: List<El>, segs: MutableList<Seg>, map: MutableMap<Sym, Seg>) {
+                  for (p in computeParts(els)) {
+                      when (p.kind) {
+                          2 -> {
+                              val e = p.els[0]
+                              collect(buildElements(e.a), segs, map)
+                              if (e.kind == 1) collect(buildElements(e.d), segs, map)
+                          }
+                          4 -> {}
+                          else -> {
+                              val seg = Seg(p.els.map { it.sym }, p.kind != 0 || mathMode)
+                              segs.add(seg)
+                              map[seg.syms[0]] = seg
+                          }
+                      }
+                  }
+              }
+
+              // Pass 3: draw one line. Every piece of text has the SAME size; powers and
+              // subscripts sit right after the text before them, raised or lowered.
+              private fun layoutLine(els: List<El>, parentSize: Float, out: Out): Res {
+                  if (els.isEmpty()) return Res("", "", 0f, 24f, 0f)
+                  val parts = computeParts(els)
+
+                  val normal = els.filter { !it.sup && !it.sub }
+                  val plainNormal = normal.filter { it.kind == 0 }
+                  val size = if (parentSize > 0f) parentSize else baseSize * textScale
+                  val ref = plainNormal.filter { it.sym.fixed == null }.ifEmpty { plainNormal }
+                  val baseline = if (ref.isNotEmpty())
+                      ref.map { it.b }.sorted()[ref.size / 2] else normal[0].cy
+                  val hsAll = ref.map { it.h }.sorted()
+                  val capH = if (hsAll.isEmpty()) 0f else hsAll[((hsAll.size - 1) * 0.85f).toInt()]
+                  val capRef = if (capH > 0f) capH else size
+
+                  val copy = StringBuilder()
+                  val expr = StringBuilder()
+                  var cursor = Float.NEGATIVE_INFINITY   // right edge of what is drawn so far
+                  var prevR = Float.NEGATIVE_INFINITY    // right edge of the previous handwriting
+                  var prevKind = -1
+                  for (p in parts) {
+                      val first = p.els[0]
+                      val color = first.sym.color
+                      when (p.kind) {
+                          0, 4 -> {
+                              val raw = if (p.kind == 4) first.sym.fixed ?: ""
+                              else (segMap[first.sym]?.text ?: "").replace("\n", " ")
+                              val t = if (p.kind != 0) raw else when (textMode) {
+                                  1 -> raw.uppercase()
+                                  2 -> chemFix(raw.replace(" ", ""), p.els.map { it.sym }, capH)
+                                  else -> raw
+                              }
+                              if (t.isNotEmpty()) {
+                                  measurePaint.textSize = size
+                                  val w = measurePaint.measureText(t)
+                                  val l = p.els.minOf { it.l }
+                                  // pieces follow each other closely; a real gap in the handwriting = one space
+                                  val hg = if (prevR == Float.NEGATIVE_INFINITY) 0f else l - prevR
+                                  val gap = when {
+                                      p.kind == 4 || prevKind == 4 -> size * 0.25f
+                                      hg > 0.5f * capRef -> size * 0.3f
+                                      else -> size * 0.06f
+                                  }
+                                  val left = if (cursor == Float.NEGATIVE_INFINITY) l else cursor + gap
+                                  out.items.add(DrawingView.TextItem(t, t, left + w / 2, baseline,
+                                      size, color, false))
+                                  cursor = left + w
+                              }
+                              copy.append(t); expr.append(t)
+                          }
+                          1, 3 -> {
+                              val isSup = p.kind == 1
+                              val t = segMap[first.sym]?.text ?: ""
+                              if (t.isNotEmpty()) {
+                                  val sz = size * 0.6f
+                                  measurePaint.textSize = sz
+                                  val w = measurePaint.measureText(t)
+                                  val left = if (cursor == Float.NEGATIVE_INFINITY) p.els.minOf { it.l }
+                                  else cursor + size * 0.03f
+                                  val y = if (isSup) baseline - size * 0.40f else baseline + size * 0.22f
+                                  out.items.add(DrawingView.TextItem(t, if (isSup) toSuper(t) else toSub(t),
+                                      left + w / 2, y, sz, color, true))
+                                  cursor = left + w
+                                  copy.append(if (isSup) toSuper(t) else toSub(t))
+                                  if (isSup) expr.append("^(").append(t).append(")")
+                              }
+                          }
+                          else -> {
+                              val s = first.sym
+                              if (first.kind == 1) {
+                                  out.lines.add(DrawingView.LineItem(s.l, s.cy, s.r, s.cy, s.color))
+                                  val n = layoutLine(buildElements(first.a), size * 0.85f, out)
+                                  val d = layoutLine(buildElements(first.d), size * 0.85f, out)
+                                  copy.append("(").append(n.copy).append(")/(").append(d.copy).append(")")
+                                  expr.append("((").append(n.expr).append(")/(").append(d.expr).append("))")
+                              } else {
+                                  addRootLines(s, out)
+                                  val inner = layoutLine(buildElements(first.a), size, out)
+                                  copy.append("√(").append(inner.copy).append(")")
+                                  expr.append("sqrt(").append(inner.expr).append(")")
+                              }
+                              cursor = maxOf(cursor, first.r)
+                          }
+                      }
+                      prevR = p.els.maxOf { it.r }
+                      prevKind = p.kind
+                  }
+                  return Res(copy.toString(), expr.toString(), baseline, size,
+                      if (cursor == Float.NEGATIVE_INFINITY) els.maxOf { it.r } else cursor)
+              }
+
+              private fun layoutAll(syms: List<Sym>): Out {
+                  val out = Out()
+                  // One text size for the whole board: taken from the first writing, then kept
+                  if (baseSize == 0f) {
+                      val hs = syms.filter { !it.root && !it.flat }.map { it.h }.sorted()
+                      baseSize = if (hs.isEmpty()) 64f * resources.displayMetrics.density
+                      else (hs[hs.size / 2] / 0.72f).coerceIn(40f, 200f)
+                  }
+                  for (line in groupLines(buildElements(syms))) {
+                      val sorted = line.sortedBy { it.l }
+                      val i0 = out.items.size
+                      val l0 = out.lines.size
+                      val res = layoutLine(sorted, 0f, out)
+                      var copy = res.copy
+
+                      // "=" at the end: write the answer right after it
+                      if (copy.trimEnd().endsWith("=")) {
+                          val v = evaluate(res.expr)
+                          if (v != null) {
+                              val ans = formatNumber(v)
+                              measurePaint.textSize = res.size
+                              val w = measurePaint.measureText(ans)
+                              val cx = res.right + res.size * 0.3f + w / 2
+                              out.items.add(DrawingView.TextItem(ans, ans, cx, res.baseline,
+                                  res.size, 0xFF2E7D32.toInt(), false))
+                              copy = copy.trimEnd() + ans
+                          }
+                      }
+
+                      if (out.items.size == i0) continue
+                      val gid = nextGroup++
+                      var x0 = Float.MAX_VALUE
+                      for (k in i0 until out.items.size) {
+                          out.items[k].group = gid
+                          x0 = minOf(x0, out.items[k].cx)
+                      }
+                      for (k in l0 until out.lines.size) out.lines[k].group = gid
+                      out.groups[gid] = DrawingView.Group(copy, res.baseline, x0, res.size, out.items.size - i0)
+                  }
+                  return out
+              }
+
+              private fun evaluate(raw: String): Double? {
+                  var s = raw.replace(" ", "").trimEnd('=')
+                  s = s.replace('×', '*').replace('x', '*').replace('X', '*').replace('·', '*')
+                      .replace('÷', '/').replace('−', '-').replace('–', '-').replace('—', '-')
+                      .replace(',', '.')
+                  val check = s.replace("sqrt", "")
+                  if (s.isEmpty() || !check.all { it in "0123456789+-*/^()." }) return null
+                  return try {
+                      val v = Parser(s).parse()
+                      if (v.isNaN() || v.isInfinite()) null else v
+                  } catch (e: Exception) { null }
+              }
+
+              private fun formatNumber(v: Double): String {
+                  if (Math.abs(v - Math.rint(v)) < 1e-9 && Math.abs(v) < 1e15)
+                      return Math.rint(v).toLong().toString()
+                  return String.format(java.util.Locale.US, "%.4f", v).trimEnd('0').trimEnd('.')
+              }
+
+              // ================= Recognition =================
+
+              private val elements = ("H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe " +
+                  "Co Ni Cu Zn Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba " +
+                  "La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn " +
+                  "Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr").split(" ").toSet()
+
+              // Capital or small letter: from the HEIGHT of what was written, checked against the
+              // chemical elements (Cl, Na, Ca are one symbol; CO, CH are two)
+              private fun chemFix(s0: String, syms: List<Sym>, capH: Float): String {
+                  if (s0.length != syms.size) return s0
+                  val sb = StringBuilder()
+                  var prevUpper = false
+                  for (i in s0.indices) {
+                      val c = s0[i]
+                      if (!c.isLetter()) { sb.append(c); prevUpper = false; continue }
+                      val tall = capH <= 0f || syms[i].h >= 0.78f * capH
+                      val canFollow = prevUpper && elements.contains("" + sb.last() + c.lowercaseChar())
+                      val single = elements.contains(c.uppercaseChar().toString())
+                      val lower = if (canFollow) (!tall || !single) else !tall
+                      sb.append(if (lower) c.lowercaseChar() else c.uppercaseChar())
+                      prevUpper = !lower
+                  }
+                  return sb.toString()
+              }
+
+              private class Task(val ink: Ink, val digit: Boolean, val set: (String) -> Unit)
+
+              // For digits/operators: among the best guesses take the first digit or operator
+              private fun pickDigit(cands: List<String>): String {
+                  val allowed = "0123456789+-−×÷=()./,"
+                  for (c in cands.take(5)) if (c.length == 1 && c[0] in allowed) return c
+                  return cands.firstOrNull() ?: "?"
+              }
+
+              private fun recognizeAndReplace() {
+                  if (!modelReady) return
+                  val snapshot = drawing.pending.toList()
+                  if (snapshot.isEmpty()) return
+                  val syms = groupSymbols(snapshot)
+
+                  // Keep the writing order of strokes (the recogniser reads them in order)
+                  val order = java.util.IdentityHashMap<Ink.Stroke, Int>()
+                  snapshot.forEachIndexed { i, ps -> order[ps.stroke] = i }
+                  fun inkOf(strokes: List<Ink.Stroke>): Ink {
+                      val b = Ink.builder()
+                      strokes.sortedBy { order[it] ?: 0 }.forEach { b.addStroke(it) }
+                      return b.build()
+                  }
+
+                  val segs = mutableListOf<Seg>()
+                  val map = HashMap<Sym, Seg>()
+                  for (line in groupLines(buildElements(syms))) collect(line.sortedBy { it.l }, segs, map)
+
+                  val tasks = mutableListOf<Task>()
+                  for (seg in segs) {
+                      if (seg.digit) {
+                          for (s in seg.syms) {
+                              val f = s.fixed
+                              if (f != null) s.text = f
+                              else tasks.add(Task(inkOf(s.strokes), true) { t -> s.text = t })
+                          }
+                      } else {
+                          tasks.add(Task(inkOf(seg.syms.flatMap { it.strokes }), false) { t -> seg.text = t })
+                      }
+                  }
+                  if (tasks.isEmpty()) { finish(snapshot, syms, segs, map); return }
+
+                  var remaining = tasks.size
+                  for (task in tasks) {
+                      recognizer.recognize(task.ink)
+                          .addOnSuccessListener { r ->
+                              val c = r.candidates.map { it.text }
+                              task.set(if (task.digit) pickDigit(c) else c.firstOrNull() ?: "")
+                          }
+                          .addOnFailureListener { task.set("?") }
+                          .addOnCompleteListener {
+                              remaining--
+                              if (remaining == 0) finish(snapshot, syms, segs, map)
+                          }
+                  }
+              }
+
+              private fun finish(
+                  snapshot: List<DrawingView.PStroke>, syms: List<Sym>,
+                  segs: List<Seg>, map: Map<Sym, Seg>
+              ) {
+                  for (seg in segs) if (seg.digit) seg.text = seg.syms.joinToString("") { it.text }
+                  segMap = map
+                  val out = layoutAll(syms)
+                  drawing.commit(snapshot, out.items, out.lines, out.groups)
+              }
+
+              // For Copy/Save text only: x² style characters
+              private val supMap = mapOf(
+                  '0' to '⁰', '1' to '¹', '2' to '²', '3' to '³', '4' to '⁴',
+                  '5' to '⁵', '6' to '⁶', '7' to '⁷', '8' to '⁸', '9' to '⁹',
+                  '+' to '⁺', '-' to '⁻', 'n' to 'ⁿ', 'i' to 'ⁱ', 'x' to 'ˣ'
+              )
+
+              private fun toSuper(t: String): String {
+                  val sb = StringBuilder()
+                  for (c in t) sb.append(supMap[c] ?: return "^($t)")
+                  return sb.toString()
+              }
+
+              private val subMap = mapOf(
+                  '0' to '₀', '1' to '₁', '2' to '₂', '3' to '₃', '4' to '₄',
+                  '5' to '₅', '6' to '₆', '7' to '₇', '8' to '₈', '9' to '₉',
+                  '+' to '₊', '-' to '₋', 'n' to 'ₙ', 'x' to 'ₓ'
+              )
+
+              private fun toSub(t: String): String {
+                  val sb = StringBuilder()
+                  for (c in t) sb.append(subMap[c] ?: return "_($t)")
+                  return sb.toString()
+              }
+
+              override fun onDestroy() { recognizer.close(); super.onDestroy() }
+          }
+          EOF_INK
+          mkdir -p app/src/main/res/mipmap-xhdpi
+          base64 -d > app/src/main/res/mipmap-xhdpi/ic_launcher.png << 'EOF_B64'
+          iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAMAAADVRocKAAABCGlDQ1BJQ0MgUHJvZmlsZQAAeJxj
+          YGA8wQAELAYMDLl5JUVB7k4KEZFRCuwPGBiBEAwSk4sLGHADoKpv1yBqL+viUYcLcKakFicD6Q9A
+          rFIEtBxopAiQLZIOYWuA2EkQtg2IXV5SUAJkB4DYRSFBzkB2CpCtkY7ETkJiJxcUgdT3ANk2uTml
+          yQh3M/Ck5oUGA2kOIJZhKGYIYnBncAL5H6IkfxEDg8VXBgbmCQixpJkMDNtbGRgkbiHEVBYwMPC3
+          MDBsO48QQ4RJQWJRIliIBYiZ0tIYGD4tZ2DgjWRgEL7AwMAVDQsIHG5TALvNnSEfCNMZchhSgSKe
+          DHkMyQx6QJYRgwGDIYMZAKbWPz9HbOBQAAACf1BMVEXd5O3f5evi6vPer57h3N5vVlG1r6ROMjCS
+          b2SnmI2wq6CqnpLOs51rb3JoWFWSbV2aYVucf4Grh3vIuaYyPkkrOUNLLipeOzdqP0VnRT5zVUt3
+          got0gIqCX023k32yina+v8S/wLu+wcfCu6vLw7HRyLfT09DNppfNy8eueGjOxrkzNTjHmYpJSEsr
+          Ki2yhXXHt63b4+uLWE2TZVbW3OJSVVi0l47i6/SUdm5ONja4tq9vSUSyqqV0VlBqZ2mypJqsioOn
+          aVnHrKQ8QUWPa2TEiHXOy8iYlpBxRDw5PUGUh4Xn8PpVW2JsOzh0dHWtcl1cYmjS0tCpa2SShHvI
+          knxGKyyJTEbo8fpoYVzCfGmGRjy+wsjk7fajW1LMxLXS0c7V085bQD3EioTLysvQx7fRyblIPkJm
+          XWF0fIXNy8nRzcWWcF2bdWi3vMLOzcpUNjGFYVK3ta7OzMfW08x7goqohHKuraa5s6nNqprKs53O
+          w7LNy8nV083n8Pno8fpILClyS0WGOzScoqm9wcbJvrLGuqvY1czkuK7g184eIyc3QENNMzBzTEN7
+          WU10U0pyd3uDXVGXcl6ddmabdm+WnKSdoZulfHCqhnW5kH62rZ/LppXLtajFvrLVy7zO1NrX3OIA
+          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
+          EOF_B64
+          mkdir -p app/src/main/res/mipmap-xxhdpi
+          base64 -d > app/src/main/res/mipmap-xxhdpi/ic_launcher.png << 'EOF_B64'
+          iVBORw0KGgoAAAANSUhEUgAAAJAAAACQCAMAAADQmBKKAAABCGlDQ1BJQ0MgUHJvZmlsZQAAeJxj
+          YGA8wQAELAYMDLl5JUVB7k4KEZFRCuwPGBiBEAwSk4sLGHADoKpv1yBqL+viUYcLcKakFicD6Q9A
+          rFIEtBxopAiQLZIOYWuA2EkQtg2IXV5SUAJkB4DYRSFBzkB2CpCtkY7ETkJiJxcUgdT3ANk2uTml
+          yQh3M/Ck5oUGA2kOIJZhKGYIYnBncAL5H6IkfxEDg8VXBgbmCQixpJkMDNtbGRgkbiHEVBYwMPC3
+          MDBsO48QQ4RJQWJRIliIBYiZ0tIYGD4tZ2DgjWRgEL7AwMAVDQsIHG5TALvNnSEfCNMZchhSgSKe
+          DHkMyQx6QJYRgwGDIYMZAKbWPz9HbOBQAAACf1BMVEXh6fGyqp/d3+OqpJ3MsZ+wp57g5/Di6vOT
+          b2Oon5dZUE/Gt6aTbmBTNTFpTEdlWVaTbmGfbWs7SFJJLyxlRD12U0q8vsPOvKprNDBjQju0foCt
+          iXSsh3rMqJ/QvsHeyLs+QkZiPzdqRT+APUS3kn+wjXq9vsO/wLe/wsa/wsjW0L/RyLfT09DNppfN
+          y8eueGjNxrkzNThJSEvImYmxhXYrKi3Ht63b4+uLWE3W3OKTZVa0l41SVVji6/RONjaVdm5vSUS5
+          tq51VlCyqaRraGqxpJrHq6Q8QkanaVjEiXWtioOPa2RxRDzn8PpWXGKXlpE4PUGtcl1sOjd1dHSQ
+          iIbNy8iSg3pcY2lHLC2ra2TIknzT0tCHSkWHRzxsYVzDe2q9wcalWlTk7fZnXGHGi4VLPUHo8vpZ
+          QD2RfYLMsp3My8qSmaLOy8jS0tC5vcPJvK3V083My8fU0st3eoLOxrfRx7XX08tOMS6Palqcdmid
+          oJurhnW4t7DQx7aFPDWmnaTPx7jMxLbPzMXR09LgqJgdIiVKLSpzPUF7gYjKqZfQzcnkt665kHzG
+          uqrSx7XLy8vj19CdoqnFuqvY08rX3OLjrKXk7PXk7fXp8vtCRkpuSkF2S0N6WEp4VUuYcF2IiYsA
+          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
+          EOF_B64
+          mkdir -p app/src/main/res/mipmap-xxxhdpi
+          base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png << 'EOF_B64'
+          iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAMAAABlApw1AAABCGlDQ1BJQ0MgUHJvZmlsZQAAeJxj
+          YGA8wQAELAYMDLl5JUVB7k4KEZFRCuwPGBiBEAwSk4sLGHADoKpv1yBqL+viUYcLcKakFicD6Q9A
+          rFIEtBxopAiQLZIOYWuA2EkQtg2IXV5SUAJkB4DYRSFBzkB2CpCtkY7ETkJiJxcUgdT3ANk2uTml
+          yQh3M/Ck5oUGA2kOIJZhKGYIYnBncAL5H6IkfxEDg8VXBgbmCQixpJkMDNtbGRgkbiHEVBYwMPC3
+          MDBsO48QQ4RJQWJRIliIBYiZ0tIYGD4tZ2DgjWRgEL7AwMAVDQsIHG5TALvNnSEfCNMZchhSgSKe
+          DHkMyQx6QJYRgwGDIYMZAKbWPz9HbOBQAAACf1BMVEXh6fHd4+mknJSwpppXUVKRbF6TcGTg5evd
+          4OW1ppmUcGRuVU6snZJSNTJxVk+bZGHPrJnIt6c9Rk7JuKRNMi5iLCtoQztnUErRqZs+QD5vPkFq
+          RT2JUT+ofIC7vMG/wLrOvsMwHh8zPkZpRD9zST+9wMUxPEQ9S1NPMjB/gnurhnauiHqfkH+7vMG9
+          vsO/w8jW0L/RyLfT09DNppbNy8iueGjNxrkzNThJSEuyhXbImYkrKi3Htq3b4+uTZVbW3OKLWEy0
+          l41SVVji6/RONjaUdm5vSUS4tq51VlBraGmyqaXHq6SxpJo8QkanaVnFiHWti4RxRDyPa2SYlpHn
+          8fo4PUF0dHNVW2Kscl1rOzeQiIaSg3tcYmjNy8hIKyzIkn2ra2TT0tCISkWGRzylWlVtYVzCe2m5
+          vcJLPkLo8fq9wchbQT1oXWLFi4bj7PXNspx3e4OOfIHU08/HuquEPDfPxrfktqyZnKO5kH3Ky83M
+          y8rV1M7X08nh1s4dIiVQMy+eoZycoqjV0syZcV6bdWirhnfRzcjMysfPy8ZKLSrPxbO6t67Rx7fP
+          xrZ6WUx9goiMZlfKqJXhppfirKPQx7jU1NCnqKW7t67Fuqzj6/Ti6vSrpJnIu6zFuqzQx7XOzMYA
+          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
+          RU5ErkJggg==
+          EOF_B64
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: InkToText-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
